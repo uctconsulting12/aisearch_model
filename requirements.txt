@@ -1,0 +1,51 @@
+# torch==2.1.1+cu121
+# torchvision==0.16.1+cu121
+# --extra-index-url https://download.pytorch.org/whl/cu121
+
+# # # Core ML frameworks - MUST match container
+# # torch==2.1.0
+# # torchvision==0.16.0
+
+# Transformers ecosystem
+transformers==4.40.0
+huggingface-hub==0.23.0
+accelerate==0.29.3
+safetensors==0.4.3
+tokenizers==0.19.1
+
+# Model-specific dependencies
+sentencepiece==0.2.0
+timm==0.9.16
+einops==0.7.0
+
+# Text processing
+ftfy==6.2.0
+regex==2024.4.28
+wcwidth==0.2.13
+
+# Image processing
+Pillow==10.3.0
+opencv-python-headless==4.9.0.80
+
+# Scientific computing
+numpy==1.26.4
+
+# AWS SDK - Use compatible versions
+boto3==1.34.90
+botocore==1.34.90
+
+# HTTP and utilities
+requests==2.31.0
+urllib3==2.2.1
+certifi==2024.2.2
+
+# System utilities
+psutil==5.9.8
+
+fastapi
+websockets 
+uvicorn[standard]
+Pillow
+flake8
+httpx
+python-multipart
