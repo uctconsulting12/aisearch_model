@@ -27,7 +27,7 @@ async def upload_video_to_s3(video_file: UploadFile):
             use_threads=True
         )
 
-        # ✅ Use upload_fileobj (supports Config and parallel upload)
+        # Use upload_fileobj (supports Config and parallel upload)
         s3.upload_fileobj(
             Fileobj=video_file.file,
             Bucket=S3_BUCKET,
@@ -37,7 +37,7 @@ async def upload_video_to_s3(video_file: UploadFile):
         )
 
         url = f"https://{S3_BUCKET}.s3.amazonaws.com/{key}"
-        logger.info(f"✅ Uploaded video to S3 at: {url}")
+        logger.info(f"Uploaded video to S3 at: {url}")
         return url
 
     except Exception as e:

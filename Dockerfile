@@ -26,4 +26,4 @@ EXPOSE 8000
 # Start app
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
 
-# docker run --gpus all -d   -p 8002:8000   -v "$USERPROFILE/.aws:/root/.aws"   --name people_container   people_image 
+# docker run --gpus all -d   -p 8000:8000   -v "$USERPROFILE/.aws:/root/.aws"   --name people_container   people_image 

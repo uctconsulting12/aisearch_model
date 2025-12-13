@@ -1,6 +1,7 @@
 __pycache__
 research
 test_videos
-venv
+aivenv
 .gitignore
 output_videos
+main.py
