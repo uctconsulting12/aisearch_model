@@ -1,0 +1,48 @@
+name: Deploy to EC2 (Build on EC2)
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy on EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ubuntu
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+           
+            echo "---- Pulling latest code ----"
+
+            # Clone or update repo in ~/aisearch_model
+            if [ ! -d ~/aisearch_model ]; then
+              git clone https://github.com/uctconsulting12/aisearch_model.git ~/aisearch_model
+            else
+              cd ~/aisearch_model
+              git pull origin main
+            fi
+
+            echo "---- Building Docker image ----"
+            cd ~/aisearch_model
+            sudo docker build -t aisearch_image .
+            echo "--- remove none images ------"
+            sudo docker image prune -f
+
+            echo "---- Stopping old container ----"
+            sudo docker stop aisearch_container || true
+            sudo docker rm aisearch_container || true
+
+            echo "---- Running new container with AWS creds ----"
+            sudo docker run -d \
+            --name aisearch_container \
+            -p 8000:8000 \
+            --gpus all \
+            -v /home/ubuntu/.aws:/root/.aws \
+            aisearch_image
+
+            echo "Deployment completed. "
