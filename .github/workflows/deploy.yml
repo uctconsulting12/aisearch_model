@@ -40,7 +40,7 @@ jobs:
             echo "---- Running new container with AWS creds ----"
             sudo docker run -d \
             --name aisearch_container \
-            -p 8000:8000 \
+            -p 8007:8007 \
             --gpus all \
             -v /home/ubuntu/.aws:/root/.aws \
             aisearch_image

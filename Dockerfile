@@ -21,9 +21,9 @@ RUN pip install --upgrade pip \
 COPY . .
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8007
 
 # Start app
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8007"]
 
 # docker run --gpus all -d   -p 8000:8000   -v "$USERPROFILE/.aws:/root/.aws"   --name people_container   people_image 
