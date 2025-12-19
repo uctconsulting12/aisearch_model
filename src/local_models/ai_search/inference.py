@@ -1,14 +1,18 @@
-# File: inference.py
+# inference.py
 """
-SageMaker Grounding DINO - Enhanced Visual Search with Context Understanding & Batch Processing
-Features:
+SageMaker OWL-ViT v2 - Enhanced Visual Search with Context Understanding & Batch Processing
+===============================================================================
+OWL-ViT v2 FOR CUDA 12.x COMPATIBILITY
+
+Key Features:
 - Batch processing support (dynamic batch_size)
+- Returns ONLY the frame with maximum confidence
 - Contextual phrase understanding
 - Strict semantic matching
-- Proper "not found" handling
 - Enhanced prompt engineering for visual search
 - Timestamp-based Frame IDs (YYYYMMDDHHMMSS)
-- Dictionary output for found frames only
+- CUDA 12.x compatible
+- Identical JSON input/output format as Grounding DINO version
 """
 
 import os
@@ -33,15 +37,15 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 
 import torch
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+from transformers import Owlv2Processor, Owlv2ForObjectDetection
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-MODEL_ID = os.getenv("MODEL_ID", "IDEA-Research/grounding-dino-base")
-BOX_THRESHOLD = float(os.getenv("BOX_THRESHOLD", "0.35"))
-NMS_THRESHOLD = float(os.getenv("NMS_THRESHOLD", "0.5"))
-CONTEXT_MATCH_THRESHOLD = float(os.getenv("CONTEXT_MATCH_THRESHOLD", "0.6"))
+MODEL_ID = os.getenv("MODEL_ID", "google/owlv2-base-patch16-ensemble")
+BOX_THRESHOLD = float(os.getenv("BOX_THRESHOLD", "0.05"))  # OWL-ViT uses lower threshold
+NMS_THRESHOLD = float(os.getenv("NMS_THRESHOLD", "0.3"))
+CONTEXT_MATCH_THRESHOLD = float(os.getenv("CONTEXT_MATCH_THRESHOLD", "0.4"))
 
 S3_ERROR_LOG_BUCKET = os.getenv("S3_ERROR_LOG_BUCKET")
 SAGEMAKER_ENDPOINT_NAME_ENV = os.getenv("SAGEMAKER_ENDPOINT_NAME")
@@ -65,6 +69,7 @@ logger = logging.getLogger(__name__)
 
 inference_handler = None
 
+
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
@@ -84,19 +89,16 @@ class ContextualPhrase:
 def generate_frame_id() -> str:
     """
     Generate frame ID in format: YYYYMMDDHHMMSS + milliseconds
-    Example: 20251004143525123
-    (YYYY=2025, MM=10, DD=04, HH=14, MM=35, SS=25, MS=123)
+    Example: 20251219143525123
     """
     try:
         now = datetime.datetime.now()
-        # Format: YYYYMMDDHHMMSS + first 3 digits of microseconds (milliseconds)
         timestamp = now.strftime("%Y%m%d%H%M%S")
         milliseconds = now.strftime("%f")[:3]
         frame_id = f"{timestamp}{milliseconds}"
         return frame_id
     except Exception as e:
         logger.warning(f"Failed to generate frame_id: {e}")
-        # Fallback with basic timestamp
         return datetime.datetime.now().strftime("%Y%m%d%H%M%S")
 
 
@@ -157,20 +159,21 @@ def parse_contextual_search(search_text: str) -> ContextualPhrase:
     Examples:
     - "Student standing in the class" -> main: student, context: standing, spatial: in the class
     - "Person sitting on chair" -> main: person, context: sitting, spatial: on chair
-    - "Dog running in park" -> main: dog, context: running, spatial: in park
+    - "Woman in red dress" -> main: woman, context: red, dress
     """
     search_lower = search_text.lower().strip()
     
     # Common action words
     action_words = ['standing', 'sitting', 'running', 'walking', 'lying', 'jumping', 
-                   'holding', 'eating', 'drinking', 'reading', 'writing', 'playing']
+                   'holding', 'eating', 'drinking', 'reading', 'writing', 'playing',
+                   'wearing']
     
     # Common spatial relations
     spatial_preps = ['in', 'on', 'at', 'near', 'beside', 'under', 'over', 'behind', 
                     'in front of', 'next to', 'between', 'among']
     
     # Common objects that are usually the main subject
-    common_subjects = ['person', 'student', 'teacher', 'man', 'woman', 'child', 'boy', 
+    common_subjects = ['person', 'student', 'teacher', 'man', 'woman', 'women', 'child', 'boy', 
                       'girl', 'dog', 'cat', 'car', 'bicycle', 'bird', 'horse']
     
     words = search_lower.split()
@@ -210,10 +213,10 @@ def parse_contextual_search(search_text: str) -> ContextualPhrase:
     )
 
 
-def format_contextual_prompt(phrase: ContextualPhrase) -> str:
+def format_contextual_prompt(phrase: ContextualPhrase) -> List[str]:
     """
-    Format the prompt to preserve context while helping the model understand.
-    This is crucial for Grounding DINO to understand the full context.
+    Format the prompt for OWL-ViT v2 (returns list of strings)
+    This is different from Grounding DINO which uses period-separated strings
     """
     prompts = []
     
@@ -225,6 +228,10 @@ def format_contextual_prompt(phrase: ContextualPhrase) -> str:
         for action in phrase.action_words:
             prompts.append(f"{action} {phrase.main_object}")
             prompts.append(f"{phrase.main_object} {action}")
+    
+    # Add with "wearing" if clothing mentioned
+    if any(word in phrase.context_words for word in ['dress', 'shirt', 'hat', 'clothes', 'red', 'blue', 'green', 'black', 'white']):
+        prompts.append(f"{phrase.main_object} wearing {' '.join(phrase.context_words)}")
     
     # Add spatial context
     if phrase.spatial_relations and phrase.main_object:
@@ -243,12 +250,9 @@ def format_contextual_prompt(phrase: ContextualPhrase) -> str:
             seen.add(p_clean)
             unique_prompts.append(p_clean)
     
-    # Join with period separator (Grounding DINO format)
-    formatted = ". ".join(unique_prompts) + "."
+    logger.info(f"[Contextual Prompt] Original: '{phrase.full_phrase}' -> Queries: {unique_prompts}")
     
-    logger.info(f"[Contextual Prompt] Original: '{phrase.full_phrase}' -> Formatted: '{formatted}'")
-    
-    return formatted
+    return unique_prompts
 
 
 def validate_contextual_match(detected_label: str, original_phrase: ContextualPhrase, 
@@ -445,14 +449,14 @@ def draw_detections_with_context(image: Image.Image, boxes: List[List[float]],
 # MODEL LOADING FUNCTIONS
 # =============================================================================
 def load_model_components(model_id: str = MODEL_ID, device: str = "cpu"):
-    """Load processor and model from HuggingFace"""
+    """Load processor and model from HuggingFace - OWL-ViT v2 specific"""
     try:
-        logger.info(f"[load_model_components] Loading from HuggingFace: {model_id}")
-        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id, trust_remote_code=True)
+        logger.info(f"[load_model_components] Loading OWL-ViT v2 from HuggingFace: {model_id}")
+        processor = Owlv2Processor.from_pretrained(model_id)
+        model = Owlv2ForObjectDetection.from_pretrained(model_id)
         model.to(device)
         model.eval()
-        logger.info("[load_model_components] Successfully loaded models and moved to device")
+        logger.info("[load_model_components] Successfully loaded OWL-ViT v2 model and moved to device")
         return processor, model
     except Exception as e:
         log_error(e, {"fn": "load_model_components", "model_id": model_id})
@@ -508,15 +512,15 @@ def enable_gpu_optimizations(model: torch.nn.Module) -> Dict[str, Any]:
 # INFERENCE CLASS
 # =============================================================================
 class VisualSearchInference:
-    """Enhanced inference class with visual search capabilities"""
+    """Enhanced inference class with visual search capabilities - OWL-ViT v2"""
     
     def __init__(self):
         self.device = None
-        self.processor: Optional[AutoProcessor] = None
-        self.model: Optional[torch.nn.Module] = None
+        self.processor: Optional[Owlv2Processor] = None
+        self.model: Optional[Owlv2ForObjectDetection] = None
         self.model_loaded = False
         self.use_fp16 = False
-        logger.info("VisualSearchInference instance created")
+        logger.info("VisualSearchInference instance created (OWL-ViT v2)")
 
     def decode_base64_image(self, base64_string: str) -> Image.Image:
         """Decode base64 encoded image"""
@@ -554,7 +558,7 @@ class VisualSearchInference:
     def detect_with_context(self, image: Image.Image, search_text: str, 
                            box_threshold: float = BOX_THRESHOLD,
                            context_threshold: float = CONTEXT_MATCH_THRESHOLD) -> Dict[str, Any]:
-        """Perform contextual visual search detection"""
+        """Perform contextual visual search detection with OWL-ViT v2"""
         try:
             # Parse the search phrase for context
             context_phrase = parse_contextual_search(search_text)
@@ -563,8 +567,8 @@ class VisualSearchInference:
             processed_img = enhance_image(image)
             processed_img = self.preprocess_image(processed_img)
             
-            # Format prompt with context preservation
-            formatted_prompt = format_contextual_prompt(context_phrase)
+            # Format prompt for OWL-ViT (list of strings)
+            text_queries = format_contextual_prompt(context_phrase)
             
             logger.info(f"[Visual Search] Original: '{search_text}'")
             logger.info(f"[Visual Search] Main object: '{context_phrase.main_object}'")
@@ -572,8 +576,12 @@ class VisualSearchInference:
             logger.info(f"[Visual Search] Spatial: {context_phrase.spatial_relations}")
             logger.info(f"[Visual Search] Box threshold: {box_threshold}, Context threshold: {context_threshold}")
             
-            # Run detection
-            inputs = self.processor(images=processed_img, text=formatted_prompt, return_tensors="pt")
+            # Run detection with OWL-ViT v2
+            inputs = self.processor(
+                text=text_queries,  # List of strings for OWL-ViT
+                images=processed_img,
+                return_tensors="pt"
+            )
             
             # Handle FP16
             if self.use_fp16:
@@ -595,31 +603,21 @@ class VisualSearchInference:
             
             target_sizes = torch.tensor([processed_img.size[::-1]], dtype=torch.long).to(self.device)
             
-            results = self.processor.post_process_grounded_object_detection(
-                outputs,
-                input_ids=inputs.get('input_ids'),
-                box_threshold=box_threshold,
+            # OWL-ViT v2 post-processing
+            results = self.processor.post_process_object_detection(
+                outputs=outputs,
+                threshold=box_threshold,  # Note: 'threshold' not 'box_threshold'
                 target_sizes=target_sizes
             )[0]
             
-            boxes_t = results.get('boxes', torch.tensor([]))
-            scores_t = results.get('scores', torch.tensor([]))
-            labels_raw = results.get('labels', [])
+            # Extract results
+            boxes = results["boxes"].cpu().numpy().tolist() if len(results["boxes"]) > 0 else []
+            scores = results["scores"].cpu().numpy().tolist() if len(results["scores"]) > 0 else []
+            labels_idx = results["labels"].cpu().numpy().tolist() if len(results["labels"]) > 0 else []
             
-            boxes = boxes_t.cpu().numpy().tolist() if isinstance(boxes_t, torch.Tensor) and boxes_t.numel() > 0 else []
-            scores = scores_t.cpu().numpy().tolist() if isinstance(scores_t, torch.Tensor) and scores_t.numel() > 0 else []
-            
-            # Process labels
-            processed_labels = []
-            try:
-                if isinstance(labels_raw, (list, tuple)):
-                    processed_labels = [str(l) for l in labels_raw]
-                elif isinstance(labels_raw, torch.Tensor):
-                    processed_labels = [str(l) for l in labels_raw.cpu().numpy().tolist()]
-                elif labels_raw:
-                    processed_labels = [str(labels_raw)]
-            except Exception:
-                processed_labels = ["object"] * len(boxes)
+            # Map label indices back to text queries
+            processed_labels = [text_queries[idx] if idx < len(text_queries) else "object" 
+                              for idx in labels_idx]
             
             logger.info(f"[Detection] Raw: {len(boxes)} detections")
             
@@ -686,7 +684,7 @@ def model_fn(model_dir):
     """SageMaker model load entrypoint"""
     global inference_handler
     logger.info("=" * 80)
-    logger.info("VISUAL SEARCH MODEL LOADING STARTED")
+    logger.info("OWL-ViT v2 VISUAL SEARCH MODEL LOADING STARTED")
     logger.info("=" * 80)
     start_time = time.time()
     
@@ -698,14 +696,16 @@ def model_fn(model_dir):
             try:
                 gpu_name = torch.cuda.get_device_name(0)
                 gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+                cuda_version = torch.version.cuda
                 logger.info(f"[OK] GPU AVAILABLE: {gpu_name} ({gpu_memory:.2f} GB)")
+                logger.info(f"[OK] CUDA VERSION: {cuda_version}")
             except Exception:
                 logger.debug("Could not query GPU name/memory")
         else:
             inference_handler.device = "cpu"
             logger.warning("[WARNING] CUDA NOT AVAILABLE - USING CPU")
         
-        logger.info(f"[INFO] Loading model from HuggingFace: {MODEL_ID}")
+        logger.info(f"[INFO] Loading OWL-ViT v2 from HuggingFace: {MODEL_ID}")
         proc, model = load_model_components(MODEL_ID, inference_handler.device)
         inference_handler.processor = proc
         
@@ -717,10 +717,11 @@ def model_fn(model_dir):
         load_time = time.time() - start_time
         
         logger.info("=" * 80)
-        logger.info(f"[SUCCESS] VISUAL SEARCH MODEL LOADED IN {load_time:.2f}s")
+        logger.info(f"[SUCCESS] OWL-ViT v2 MODEL LOADED IN {load_time:.2f}s")
         logger.info(f"[INFO] Device: {inference_handler.device.upper()} | FP16: {inference_handler.use_fp16}")
         logger.info(f"[INFO] Context Validation: {ENABLE_CONTEXT_VALIDATION}")
         logger.info(f"[INFO] Context Threshold: {CONTEXT_MATCH_THRESHOLD}")
+        logger.info(f"[INFO] Box Threshold: {BOX_THRESHOLD}")
         logger.info("=" * 80)
         
         return inference_handler
@@ -743,7 +744,7 @@ def input_fn(request_body, content_type='application/json'):
 
 
 def predict_fn(input_data, model):
-    """Main prediction with batch processing and contextual visual search"""
+    """Main prediction with batch processing - returns ONLY best frame"""
     global inference_handler
     logger.info("=" * 80)
     logger.info("VISUAL SEARCH BATCH PREDICTION STARTED")
@@ -788,14 +789,19 @@ def predict_fn(input_data, model):
         logger.info(f"Total Frames={total_frames}, Batch Size={batch_size}")
         logger.info(f"Thresholds: box={box_threshold}, context={context_threshold}, nms={nms_threshold}")
         
-        # Initialize batch results
-        detected_frames = {}  # Dictionary: {frame_id: annotated_base64}
-        confidence_list = []  # List of confidence scores
+        # Initialize tracking for best frame
+        best_frame_data = {
+            'frame_id': None,
+            'annotated_image': None,
+            'confidence': 0.0,
+            'global_frame_idx': -1
+        }
+        
+        total_frames_found = 0
         total_inference_time = 0
         processing_errors = []
         
         # Calculate number of batches
-        import math
         num_batches = math.ceil(total_frames / batch_size)
         logger.info(f"Processing in {num_batches} batches")
         
@@ -847,24 +853,37 @@ def predict_fn(input_data, model):
                         
                         logger.info(f"[Frame {global_frame_idx}] FOUND: '{best_label}' with confidence {confidence}")
                         
-                        # Generate annotated frame if requested
-                        if annotated_frame:
-                            try:
-                                annotated_img = draw_detections_with_context(
-                                    image, [best_box], [best_label], [best_score], search_text
-                                )
-                                annotated_encoding = inference_handler.encode_image_to_base64(annotated_img)
-                                
-                                # Add to results
-                                detected_frames[frame_id] = annotated_encoding
-                                confidence_list.append(confidence)
-                                
-                            except Exception as e:
-                                logger.error(f"[Frame {global_frame_idx}] Failed to generate annotation: {e}")
-                                processing_errors.append({
-                                    "frame_index": global_frame_idx,
-                                    "error": f"Annotation failed: {str(e)}"
-                                })
+                        total_frames_found += 1
+                        
+                        # Check if this is the best frame so far
+                        if confidence > best_frame_data['confidence']:
+                            logger.info(f"[Frame {global_frame_idx}] NEW BEST FRAME: {confidence} > {best_frame_data['confidence']}")
+                            
+                            # Generate annotated frame if requested
+                            if annotated_frame:
+                                try:
+                                    annotated_img = draw_detections_with_context(
+                                        image, [best_box], [best_label], [best_score], search_text
+                                    )
+                                    annotated_encoding = inference_handler.encode_image_to_base64(annotated_img)
+                                    
+                                    # Update best frame data
+                                    best_frame_data['frame_id'] = frame_id
+                                    best_frame_data['annotated_image'] = annotated_encoding
+                                    best_frame_data['confidence'] = confidence
+                                    best_frame_data['global_frame_idx'] = global_frame_idx
+                                    
+                                except Exception as e:
+                                    logger.error(f"[Frame {global_frame_idx}] Failed to generate annotation: {e}")
+                                    processing_errors.append({
+                                        "frame_index": global_frame_idx,
+                                        "error": f"Annotation failed: {str(e)}"
+                                    })
+                            else:
+                                # No annotation needed, just track metadata
+                                best_frame_data['frame_id'] = frame_id
+                                best_frame_data['confidence'] = confidence
+                                best_frame_data['global_frame_idx'] = global_frame_idx
                     else:
                         logger.debug(f"[Frame {global_frame_idx}] Not found")
                     
@@ -892,7 +911,6 @@ def predict_fn(input_data, model):
                 torch.cuda.empty_cache()
         
         # Calculate statistics
-        total_frames_found = len(detected_frames)
         detection_rate = round((total_frames_found / total_frames) * 100, 2) if total_frames > 0 else 0.0
         total_time = time.time() - start_time
         average_inference_per_frame = round((total_inference_time / total_frames) * 1000, 2) if total_frames > 0 else 0
@@ -900,11 +918,24 @@ def predict_fn(input_data, model):
         logger.info("=" * 80)
         logger.info(f"BATCH PROCESSING COMPLETE")
         logger.info(f"Total Frames: {total_frames} | Found: {total_frames_found} | Rate: {detection_rate}%")
+        
+        # Prepare detected_frames dictionary (empty or single best frame)
+        detected_frames = {}
+        confidence_list = []
+        
+        if best_frame_data['frame_id'] is not None:
+            if annotated_frame and best_frame_data['annotated_image']:
+                detected_frames[best_frame_data['frame_id']] = best_frame_data['annotated_image']
+            confidence_list.append(best_frame_data['confidence'])
+            logger.info(f"BEST FRAME: Frame {best_frame_data['global_frame_idx']} | ID: {best_frame_data['frame_id']} | Confidence: {best_frame_data['confidence']}")
+        else:
+            logger.info("NO FRAMES DETECTED")
+        
         logger.info(f"Total Time: {int(total_time * 1000)}ms | Inference Time: {int(total_inference_time * 1000)}ms")
         logger.info(f"Average per Frame: {average_inference_per_frame}ms")
         logger.info("=" * 80)
         
-        # Prepare response
+        # Prepare response - IDENTICAL FORMAT AS GROUNDING DINO
         response = {
             "orgid": orgid,
             "processid": processid,
@@ -913,8 +944,8 @@ def predict_fn(input_data, model):
             "total_frames_processed": total_frames,
             "total_frames_found": total_frames_found,
             "detection_rate": detection_rate,
-            "detected_frames": detected_frames,
-            "confidence": confidence_list,
+            "detected_frames": detected_frames,  # Dictionary with single best frame or empty
+            "confidence": confidence_list,  # List with single confidence or empty
             "processing_time": f"{int(total_time * 1000)}ms",
             "total_inference_time": f"{int(total_inference_time * 1000)}ms",
             "average_inference_per_frame": f"{average_inference_per_frame}ms",
@@ -933,7 +964,7 @@ def predict_fn(input_data, model):
     except Exception as e:
         log_error(e, {"fn": "predict_fn", "search_text": input_data.get('search_text', 'N/A') if isinstance(input_data, dict) else 'N/A'})
         
-        # Return error response
+        # Return error response - IDENTICAL FORMAT AS GROUNDING DINO
         return {
             'error': str(e),
             'error_type': type(e).__name__,
@@ -1026,133 +1057,3 @@ def fetch_gpu_cloudwatch_metrics(namespace: str = "DCGM",
         logger.debug(f"CloudWatch metrics fetch failed: {e}")
     
     return result
-
-
-
-
-
-if __name__ == "__main__":
-    import cv2
-    import io
-    import base64
-    from PIL import Image
-    import numpy as np
-    import time
-
-    print("[INFO] Running Grounding DINO local batched video test...")
-
-    # ---------- Load model ----------
-    model_dir = "."
-    model = model_fn(model_dir)
-    print("[INFO] Model loaded successfully.")
-
-    # ---------- Video input ----------
-    video_path = r"C:\Users\uct\Desktop\AICCTV_ec2\test_videos\istockphoto-1404365178-640_adpp_is.mp4"  # Replace with your video file path
-    output_path = "annotated_output.mp4"
-    prompt = "person wearing helmet"  # Modify as needed
-
-    # ---------- Parameters ----------
-    FRAME_SKIP = 5        # Process every 5th frame
-    BATCH_SIZE = 8        # Number of frames per batch
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise Exception(f"Cannot open video: {video_path}")
-
-    # ---------- Video writer setup ----------
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"[INFO] Total frames: {frame_count}, FPS: {fps}")
-    print(f"[INFO] Skipping every {FRAME_SKIP-1} frames, batch size = {BATCH_SIZE}")
-
-    # ---------- Frame-wise inference ----------
-    frame_idx = 0
-    total_time = 0
-    batch_frames = []
-    batch_ids = []
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_idx += 1
-
-        # Skip frames for efficiency
-        if frame_idx % FRAME_SKIP != 0:
-            continue
-
-        # Encode frame to base64
-        _, buffer = cv2.imencode(".jpg", frame)
-        img_base64 = base64.b64encode(buffer).decode("utf-8")
-
-        batch_frames.append(img_base64)
-        batch_ids.append(frame_idx)
-
-        # When batch full -> run inference
-        if len(batch_frames) == BATCH_SIZE:
-            start_time = time.time()
-
-            input_data = {
-                "orgid": 1,
-                "processid": 1,
-                "cam_id": 1,
-                "search_text": prompt,
-                "frames": batch_frames,
-                "batch_size": BATCH_SIZE,
-                "annotated_frame": True
-            }
-
-            output = predict_fn(input_data, model)
-
-            # Write annotated frames back
-            detected_frames = output.get("detected_frames", {})
-            for fid, img_b64 in detected_frames.items():
-                idx = int(fid)
-                annotated_img_bytes = base64.b64decode(img_b64)
-                img = Image.open(io.BytesIO(annotated_img_bytes))
-                frame_annotated = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                out.write(frame_annotated)
-                print(f"[Frame {idx}] Annotated and written.")
-            
-            elapsed = time.time() - start_time
-            total_time += elapsed
-            print(f"[Batch of {BATCH_SIZE}] Processed in {elapsed:.2f}s")
-
-            # Clear batch
-            batch_frames = []
-            batch_ids = []
-
-    # Process any remaining frames in last batch
-    if batch_frames:
-        input_data = {
-            "orgid": 1,
-            "processid": 1,
-            "cam_id": 1,
-            "search_text": prompt,
-            "frames": batch_frames,
-            "batch_size": len(batch_frames),
-            "annotated_frame": True
-        }
-        output = predict_fn(input_data, model)
-        detected_frames = output.get("detected_frames", {})
-        for fid, img_b64 in detected_frames.items():
-            annotated_img_bytes = base64.b64decode(img_b64)
-            img = Image.open(io.BytesIO(annotated_img_bytes))
-            frame_annotated = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            out.write(frame_annotated)
-
-    # ---------- Cleanup ----------
-    cap.release()
-    out.release()
-    avg_fps = (frame_count / total_time) if total_time > 0 else 0
-    print(f"[INFO] Annotated video saved as '{output_path}'")
-    print(f"[INFO] Average processing FPS: {avg_fps:.2f}")
-    print("[INFO] Inference test completed.")
-
-
