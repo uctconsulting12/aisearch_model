@@ -3,8 +3,8 @@
 # --extra-index-url https://download.pytorch.org/whl/cu121
 
 # # # Core ML frameworks - MUST match container
-# # torch==2.1.0
-# # torchvision==0.16.0
+torch==2.1.0
+torchvision==0.16.0
 
 # Transformers ecosystem
 transformers==4.40.0
