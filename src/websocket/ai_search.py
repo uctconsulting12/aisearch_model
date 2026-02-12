@@ -224,6 +224,22 @@ def run_ai_search(
                 else:
                     logger.info(f"[{client_id}] Batch processed, no detections.")
 
+                # ✅ Update metadata even if no detections (for final "no results" response)
+                if not detections.get("detected_frames"):
+                    last_inference_metadata = {
+                        "orgid": detections.get("orgid", org_id),
+                        "processid": detections.get("processid", process_id),
+                        "cam_id": detections.get("cam_id", camera_id),
+                        "search_text": detections.get("search_text", search_text),
+                        "total_frames_processed": detections.get("total_frames_processed", len(batch_frames)),
+                        "processing_time": detections.get("processing_time", "0ms"),
+                        "total_inference_time": detections.get("total_inference_time", "0ms"),
+                        "average_inference_per_frame": detections.get("average_inference_per_frame", "0ms"),
+                        "device": detections.get("device", "unknown"),
+                        "box_threshold_used": detections.get("box_threshold_used", 0.6),
+                        "context_threshold_used": detections.get("context_threshold_used", 0.6)
+                    }
+
             except Exception as e:
                 logger.exception(f"[{client_id}] Batch error -> {e}")
 
@@ -283,68 +299,129 @@ def run_ai_search(
 
                 logger.info(
                     f"[{client_id}] Final batch processed, {len(detected_frame_ids)} detections found. Total: {len(all_detections)}")
+            else:
+                # ✅ Update metadata even if no detections in final batch
+                last_inference_metadata = {
+                    "orgid": detections.get("orgid", org_id),
+                    "processid": detections.get("processid", process_id),
+                    "cam_id": detections.get("cam_id", camera_id),
+                    "search_text": detections.get("search_text", search_text),
+                    "total_frames_processed": detections.get("total_frames_processed", len(batch_frames)),
+                    "processing_time": detections.get("processing_time", "0ms"),
+                    "total_inference_time": detections.get("total_inference_time", "0ms"),
+                    "average_inference_per_frame": detections.get("average_inference_per_frame", "0ms"),
+                    "device": detections.get("device", "unknown"),
+                    "box_threshold_used": detections.get("box_threshold_used", 0.6),
+                    "context_threshold_used": detections.get("context_threshold_used", 0.6)
+                }
 
         except Exception as e:
             logger.exception(f"[{client_id}] Final batch error -> {e}")
 
-    # ---- Send TOP 5 results sorted by timestamp to client ----
+    # ---- Send TOP 5 results sorted by timestamp to client OR send "No results found" ----
     ws = sessions.get(client_id, {}).get("ws")
-    if all_detections and ws:
+    if ws:
         try:
-            # ✅ Sort all detections by frame number (earliest first)
-            # Create list of tuples: (frame_number, frame_id, timestamp, confidence)
-            detection_list = []
-            frame_ids = list(all_detections.keys())
+            if all_detections:
+                # ✅ CASE 1: Detections found - Sort and send top 5
+                # Create list of tuples: (frame_number, frame_id, timestamp, confidence)
+                detection_list = []
+                frame_ids = list(all_detections.keys())
 
-            for i, frame_id in enumerate(frame_ids):
-                detection_list.append({
-                    "frame_number": all_frame_numbers[i] if i < len(all_frame_numbers) else i,
-                    "frame_id": frame_id,
-                    "image": all_detections[frame_id],
-                    "timestamp": all_timestamps[i] if i < len(all_timestamps) else "00:00",
-                    "confidence": all_confidences[i] if i < len(all_confidences) else 0.0
-                })
+                for i, frame_id in enumerate(frame_ids):
+                    detection_list.append({
+                        "frame_number": all_frame_numbers[i] if i < len(all_frame_numbers) else i,
+                        "frame_id": frame_id,
+                        "image": all_detections[frame_id],
+                        "timestamp": all_timestamps[i] if i < len(all_timestamps) else "00:00",
+                        "confidence": all_confidences[i] if i < len(all_confidences) else 0.0
+                    })
 
-            # Sort by frame number (earliest timestamp first)
-            detection_list.sort(key=lambda x: x["frame_number"])
+                # Sort by frame number (earliest timestamp first)
+                detection_list.sort(key=lambda x: x["frame_number"])
 
-            # ✅ Take top 5
-            top_5 = detection_list[:5]
+                # ✅ Take top 5
+                top_5 = detection_list[:5]
 
-            # Build final response with top 5
-            top_5_detections = {item["frame_id"]: item["image"] for item in top_5}
-            top_5_timestamps = [item["timestamp"] for item in top_5]
-            top_5_confidences = [item["confidence"] for item in top_5]
+                # Build final response with top 5
+                top_5_detections = {item["frame_id"]: item["image"] for item in top_5}
+                top_5_timestamps = [item["timestamp"] for item in top_5]
+                top_5_confidences = [item["confidence"] for item in top_5]
 
-            response = {
-                # Detection results (TOP 5)
-                "detected_frames": top_5_detections,
-                "confidence": top_5_confidences,
-                "timestamps": top_5_timestamps,
+                response = {
+                    # Status
+                    "status": "success",
 
-                # Video-specific metadata (added by ai_search.py)
-                "video_fps": fps,
-                "batch_size_used": BATCH_SIZE,
-                "frame_skip_used": FRAME_SKIP,
-                "total_detections_found": len(all_detections),  # Total found
-                "detections_returned": len(top_5)  # Top 5 returned
-            }
+                    # Detection results (TOP 5)
+                    "detected_frames": top_5_detections,
+                    "confidence": top_5_confidences,
+                    "timestamps": top_5_timestamps,
 
-            # ✅ Merge all inference metadata
-            response.update(last_inference_metadata)
+                    # Video-specific metadata (added by ai_search.py)
+                    "video_fps": fps,
+                    "batch_size_used": BATCH_SIZE,
+                    "frame_skip_used": FRAME_SKIP,
+                    "total_detections_found": len(all_detections),  # Total found
+                    "detections_returned": len(top_5)  # Top 5 returned
+                }
 
-            asyncio.run_coroutine_threadsafe(
-                ws.send_text(json.dumps(response)),
-                loop
-            )
-            logger.info(
-                f"[{client_id}] ✅ Sent top {len(top_5)} detections (out of {len(all_detections)} total) sorted by timestamp.")
-            logger.info(f"[{client_id}] Top 5 Timestamps: {top_5_timestamps}")
+                # ✅ Merge all inference metadata
+                response.update(last_inference_metadata)
+
+                asyncio.run_coroutine_threadsafe(
+                    ws.send_text(json.dumps(response)),
+                    loop
+                )
+                logger.info(
+                    f"[{client_id}] ✅ Sent top {len(top_5)} detections (out of {len(all_detections)} total) sorted by timestamp.")
+                logger.info(f"[{client_id}] Top 5 Timestamps: {top_5_timestamps}")
+
+            else:
+                # ✅ CASE 2: No detections found - Send "No results found" notification
+                response = {
+                    # Status
+                    "status": "No results found",
+
+                    # Basic metadata
+                    "orgid": last_inference_metadata.get("orgid", org_id),
+                    "processid": last_inference_metadata.get("processid", process_id),
+                    "cam_id": last_inference_metadata.get("cam_id", camera_id),
+                    "search_text": last_inference_metadata.get("search_text", search_text),
+
+                    # Detection results (marked as N/A)
+                    "detected_frames": "N/A",
+                    "confidence": "N/A",
+                    "timestamps": "N/A",
+                    "total_detections_found": 0,
+                    "detections_returned": 0,
+
+                    # Video-specific metadata
+                    "video_fps": fps,
+                    "batch_size_used": BATCH_SIZE,
+                    "frame_skip_used": FRAME_SKIP,
+
+                    # Processing stats (from last batch if available, otherwise defaults)
+                    "total_frames_processed": last_inference_metadata.get("total_frames_processed", "N/A"),
+                    "processing_time": last_inference_metadata.get("processing_time", "N/A"),
+                    "total_inference_time": last_inference_metadata.get("total_inference_time", "N/A"),
+                    "average_inference_per_frame": last_inference_metadata.get("average_inference_per_frame", "N/A"),
+                    "device": last_inference_metadata.get("device", "unknown"),
+                    "box_threshold_used": last_inference_metadata.get("box_threshold_used", 0.6),
+                    "context_threshold_used": last_inference_metadata.get("context_threshold_used", 0.6),
+                    "detection_rate": 0.0
+                }
+
+                asyncio.run_coroutine_threadsafe(
+                    ws.send_text(json.dumps(response)),
+                    loop
+                )
+                logger.info(
+                    f"[{client_id}] ℹ️ No detections found in entire video. Sent 'No results found' notification.")
 
         except Exception as e:
-            logger.error(f"[{client_id}] ❌ Error sending detections -> {e}")
+            logger.error(f"[{client_id}] ❌ Error sending response -> {e}")
     else:
-        logger.warning(f"[{client_id}] ⚠️ No active WebSocket or no detections found in entire video.")
+        logger.warning(f"[{client_id}] ⚠️ No active WebSocket connection found.")
 
     cap.release()
     if client_id in sessions:
